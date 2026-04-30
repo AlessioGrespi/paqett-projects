@@ -1,0 +1,11 @@
+{
+  "folders": [
+    {
+      "path": "atmospheric sensing",
+      "name": "Atmospheric Sensing (PlatformIO)"
+    }
+  ],
+  "settings": {
+    "platformio-ide.projectDir": "."
+  }
+}
