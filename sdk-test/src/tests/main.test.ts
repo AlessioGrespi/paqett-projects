@@ -405,13 +405,6 @@ describe("Edge Cases & Robustness", () => {
     expect((await serial.waitForTest("8.2", 5_000)).status).toBe("pass");
   });
 
-  it("device.reset() clears certificates", async () => {
-    serial.send({ action: "reset" });
-    const r = await serial.waitForTest("8.3", 10_000);
-    expect(r.status).toBe("pass");
-    const ev = await serial.waitForEvent("device_reset", 5_000);
-    expect(ev.value).toBe("done");
-  });
 });
 
 // ── OTA (LAST — may reboot device) ───────────────────────────
@@ -430,7 +423,7 @@ describe("OTA Updates", () => {
     if (!thingName) return;
     await api.setDesired(apiKey, thingName, {
       fw_target: "9.9.9",
-      ota_url: "http://localhost:3000/api/v1/firmware/9.9.9/download",
+      ota_url: "http://192.168.1.240:3000/api/v1/firmware/NONEXISTENT/download",
       ota_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
     });
     await new Promise((r) => setTimeout(r, 10_000));
@@ -441,37 +434,76 @@ describe("OTA Updates", () => {
     });
   });
 
-  // Skip: delta is published and download URL returns 200, but the ESP32
-  // doesn't initiate the HTTP download. Needs serial monitor debugging.
-  it.skip("full OTA update cycle", async () => {
+  it("full OTA update cycle", async () => {
     if (!thingName) return;
     const { createHash } = await import("node:crypto");
     const { readFile } = await import("node:fs/promises");
     const { buildWithVersion } = await import("../helpers/pio.js");
 
+    // Build firmware with different version
+    console.log("    [ota] Building firmware v9.9.9...");
     const binPath = await buildWithVersion("9.9.9");
     const bin = await readFile(binPath);
     const sha256 = createHash("sha256").update(bin).digest("hex");
-    await api.uploadFirmware(apiKey, "9.9.9", binPath);
+    console.log(`    [ota] Uploading (${bin.length} bytes, sha256=${sha256.substring(0, 16)}...)`);
+    try { await api.uploadFirmware(apiKey, "9.9.9", binPath); } catch { /* may already exist */ }
 
+    // Trigger OTA via shadow desired
     const publicUrl = process.env.PUBLIC_BASE_URL ?? "http://192.168.1.240:3000";
+    console.log("    [ota] Setting desired state to trigger OTA...");
     await api.setDesired(apiKey, thingName, {
       fw_target: "9.9.9",
       ota_url: `${publicUrl}/api/v1/firmware/9.9.9/download`,
       ota_sha256: sha256,
     });
 
+    // Poll shadow for reported firmware version to change.
+    // After OTA reboot, the device waits for {"action":"start"} before begin().
+    // Send start periodically so the rebooted device can provision and report.
+    console.log("    [ota] Waiting for device to update (up to 90s)...");
     let updated = false;
     for (let i = 0; i < 30; i++) {
       await new Promise((r) => setTimeout(r, 3000));
+      // Nudge device in case it rebooted and is waiting for start
+      try { serial.send({ action: "start" }); } catch { /* serial may be disconnected */ }
       try {
         const shadow = await api.getShadow(apiKey, thingName);
-        if (shadow.reported?.firmware === "9.9.9" || shadow.reported?.fw === "9.9.9") {
-          updated = true; break;
+        const fw = shadow.reported?.firmware || shadow.reported?.fw;
+        if (fw === "9.9.9") {
+          console.log(`    [ota] Device updated to v9.9.9 after ~${(i + 1) * 3}s`);
+          updated = true;
+          break;
         }
-      } catch { /* rebooting */ }
+      } catch { /* device rebooting */ }
     }
     expect(updated).toBe(true);
+
+    // Clear OTA desired state and restore original firmware via USB
+    await api.setDesired(apiKey, thingName, { fw_target: null, ota_url: null, ota_sha256: null });
+    console.log("    [ota] Restoring v1.0.0 via USB flash...");
+    // Close serial so flash can access the port
+    await serial.close();
     await flash();
   }, 180_000);
+});
+
+// ── Cleanup (LAST — disconnects device) ──────────────────────
+
+describe("Cleanup", () => {
+  it("device.reset() clears certificates", async () => {
+    // Reopen serial if closed by OTA test, wait for device to boot
+    try { await serial.open(); } catch { /* may already be open */ }
+    await new Promise((r) => setTimeout(r, 3000));
+    serial.flush();
+    // Send start in case device rebooted from OTA flash restore
+    serial.send({ action: "start" });
+    try { await serial.waitForReady("wifi", 30_000); } catch { /* may already be past boot */ }
+    // Wait for provisioning to complete before reset
+    try { await serial.waitForReady("self_tests_complete", 90_000); } catch { /* may already be done */ }
+    serial.send({ action: "reset" });
+    const r = await serial.waitForTest("8.3", 10_000);
+    expect(r.status).toBe("pass");
+    const ev = await serial.waitForEvent("device_reset", 5_000);
+    expect(ev.value).toBe("done");
+  }, 120_000);
 });
