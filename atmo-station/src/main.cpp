@@ -21,7 +21,7 @@
 
 // ── Pin definitions ──────────────────────────────────────────
 
-#define NEOPIXEL_PIN 8
+#define NEOPIXEL_PIN 9
 #define SDA_PIN 19
 #define SCL_PIN 18
 #define STEMMA_PWR 20
@@ -222,6 +222,11 @@ void setup() {
   Serial.println("  Adafruit Feather ESP32-C6");
   Serial.println("========================================\n");
 
+  // Enable NeoPixel + I2C power before anything else
+  pinMode(STEMMA_PWR, OUTPUT);
+  digitalWrite(STEMMA_PWR, HIGH);
+  delay(50);
+
   // NeoPixel — brief blue flash to show we're alive
   pixel.begin();
   setLed(0, 0, 255, 30);
@@ -257,10 +262,11 @@ void setup() {
 
   // Register LED command handlers
   device.onCommand("led_set", [](JsonObject& params) -> bool {
-    int r = params["r"] | 0;
-    int g = params["g"] | 0;
-    int b = params["b"] | 0;
-    int brightness = params["brightness"] | 50;
+    JsonObject p = params["payload"].as<JsonObject>();
+    int r = p["r"] | 0;
+    int g = p["g"] | 0;
+    int b = p["b"] | 0;
+    int brightness = p["brightness"] | 50;
     setLed(r, g, b, brightness);
     Serial.printf("[led] set r=%d g=%d b=%d brightness=%d\n", r, g, b, brightness);
     return true;
