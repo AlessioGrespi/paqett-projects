@@ -1,9 +1,0 @@
-sensirion/Sensirion I2C SCD4x
-adafruit/Adafruit NeoPixel
-bblanchon/ArduinoJson@^7.0.0
-knolleary/PubSubClient@^2.8
-adafruit/Adafruit MAX1704X
-adafruit/Adafruit LSM6DS
-adafruit/Adafruit SGP41
-paqett-device-sdk=symlink:///Users/alessio/Documents/GitHub/paqett-device-sdk/device
-adafruit/Adafruit BME680 Library
