@@ -1,17 +1,19 @@
 # Paqett SDK E2E Test Suite — Status
 
-## Results: 30/39 passing
+## Results: 44/44 passing
 
 ```
  ✓ WiFi & Network (4/4)
  ✓ Certificate Storage (6/6)
  ✓ Two-Step Provisioning (4/4)
- ✓ MQTT & Telemetry (5/5)
- ~ Shadow State (4/5) — 1 timing issue
- ✗ Commands - direct MQTT (0/4)
- ~ Commands - server API (2/5) — 3 fail on delivery
- ✓ OTA Updates (2/2 + 1 todo)
- ✓ Edge Cases (3/3)
+ ✓ MQTT & Telemetry (7/7) — includes 50-msg burst + near-buffer-limit
+ ✓ Shadow State (6/6) — includes rapid concurrent changes
+ ✓ Commands - direct MQTT (4/4)
+ ✓ Commands - server API (6/6) — includes TTL expiry
+ ✓ MQTT Resilience (1/1) — forced disconnect recovery
+ ✓ Edge Cases (2/2)
+ ✓ OTA Updates (3/3) — bad SHA256 rejection + full update cycle
+ ✓ Cleanup (1/1)
 ```
 
 ## How to run
@@ -19,7 +21,7 @@
 ```bash
 # Prerequisites
 cd paqett-server
-MQTT_PUBLIC_ENDPOINT="mqtts://192.168.1.240" npx tsx --no-cache src/main.ts
+PUBLIC_BASE_URL="http://192.168.1.240:3000" MQTT_PUBLIC_ENDPOINT="mqtts://192.168.1.240" npx tsx --no-cache src/main.ts
 
 # Run tests (ESP32-S3 plugged into COM port)
 cd paqett-projects/sdk-test
@@ -34,70 +36,40 @@ The test runner auto-detects the serial port, sends a start command to the firmw
 - NVS certificate storage (save, load, clear, persist across reboot)
 - Two-step provisioning (claim cert → device cert → stored in NVS)
 - mTLS MQTT connection to EMQX on port 8883
-- Telemetry publishing (single, multi-field, rapid 10x, large payload)
+- Telemetry publishing (single, multi-field, rapid 10x, burst 50x, large payload, near-buffer-limit)
 - Telemetry verified in server via REST API
 - Shadow reported state (device → server)
 - Shadow desired state (server → device via delta)
+- Rapid concurrent shadow changes without corruption
+- Commands via direct MQTT (calibrate, params, failure, unknown)
+- Commands via server REST API (send, history, TTL, unknown, 404)
+- Command TTL expiration tracking in server DB
+- MQTT forced disconnect recovery (EMQX kick → reconnect → commands work)
+- OTA bad SHA256 rejection (device doesn't crash)
+- Full OTA update cycle (build v9.9.9 → upload → rollout → device downloads → flashes → reboots → reports new version → convergence)
 - Device reset clears NVS
-- OTA bad SHA256 rejection
 
-## Where it's stuck: commands don't reach the device
+## Bugs found and fixed during testing
 
-The remaining 8 failures are all the same root issue: **the device can't receive MQTT messages on the `commands` topic**, even though shadow delta delivery works perfectly.
+1. **Dangling `_instance` pointer** — `PaqettDevice` constructor unconditionally set `_instance = this`. When `testEdgeCases()` created temporary devices on the stack, `_instance` pointed to freed memory. Every MQTT callback after that dereferenced garbage → Guru Meditation crash (`LoadProhibited`). **Fix**: `if (_instance == nullptr) _instance = this`.
 
-### What works vs what doesn't
+2. **Server `action` vs SDK `command` field** — Server published `{id, action, payload}` but device SDK read `doc["command"]`. Commands silently failed (nullptr early return). **Fix**: Server now sends `{id, command: action, payload}`.
 
-| Feature | Publisher | Topic | Works? |
-|---------|-----------|-------|--------|
-| Shadow delta | `paqett-ingest` (server) | `devices/{id}/shadow/delta` | ✓ |
-| Commands | `paqett-ingest` (server API) | `devices/{id}/commands` | ✗ |
-| Commands | `paqett-test-runner` (test) | `devices/{id}/commands` | ✗ |
+3. **QoS 0 subscriptions** — Both shadow and command subscriptions used QoS 0 (default). Non-retained messages could be silently dropped. **Fix**: Upgraded to QoS 1 with return value checks.
 
-Both shadow and commands use the same EMQX broker, same device subscription mechanism (`PubSubClient.subscribe()`), and the device is confirmed connected + subscribed (verified via EMQX REST API during test).
+4. **OTA version loop** — Device didn't check if `fw_target` matched current firmware version. After OTA reboot, retained delta re-triggered OTA infinitely. **Fix**: `strcmp(fwTarget, PAQETT_FIRMWARE_VERSION) != 0` guard.
 
-### What I've verified
+5. **Serial `waitFor` event leak** — When `waitForEvent()` used the listener path (event arrives after wait starts), the consumed event stayed in the buffer. Next test picked it up → off-by-one failures. **Fix**: Listener callback now removes event from `this.lines`.
 
-- EMQX shows the device subscribed to `devices/{id}/commands` (QoS 0)
-- EMQX shows the device subscribed to `devices/{id}/shadow/delta` (QoS 0)
-- Shadow delta IS delivered (tests pass)
-- Publishing from `paqett-test-runner` to `devices/{id}/commands` works in isolation (manual Node.js test with QoS 1 + 500ms delay)
-- ACL rules are correct (verified inside Docker container)
-- The `sendCommand` server API stores in DB and publishes via `paqett-ingest`
+6. **EMQX CRL check** — `enable_crl_check = true` blocked ALL mTLS connections because step-ca CRL endpoints aren't reachable from Docker. **Fix**: Set to `false`.
 
-### What I suspect but haven't confirmed
+7. **EMQX server cert missing LAN IP** — SAN only had `DNS:emqx, DNS:localhost, IP:127.0.0.1`. ESP32's mbedtls rejected when connecting to `192.168.1.240`. **Fix**: Regenerated cert with `--san 192.168.1.240`.
 
-1. **Timing**: The commands test runs ~100s into the test. The device's `PubSubClient` subscription to `commands` may have silently dropped (QoS 0, no SUBACK confirmation). Shadow delta works because it's retained and published with QoS 1.
+8. **Server returned wrong CA chain** — Provisioner returned only root_ca.crt but EMQX server cert is signed by intermediate CA. **Fix**: Return intermediate_ca.crt.
 
-2. **PubSubClient buffer**: The retained shadow delta message may be consuming the PubSubClient buffer, preventing the commands message from being processed. PubSubClient has a 2048-byte buffer.
+9. **PaqettCertStorage double-init** — ESP32 Preferences `begin()` fails if namespace already open. **Fix**: Added `close()` method.
 
-3. **Callback routing**: The SDK's `mqttCallback` routes messages by checking `topic.indexOf("/shadow/")` and `topic.indexOf("/commands")`. If a retained delta message arrives during the commands phase, it might be processed first and block subsequent messages.
-
-### Next steps to try
-
-1. **Add debug logging to PubSubClient callback** — print every incoming MQTT message in the firmware to see if commands arrive at the PubSubClient level
-2. **Check if PubSubClient.subscribe() returns true** — add a return value check and emit it as a test event
-3. **Try QoS 1 subscription** — `PubSubClient.subscribe(topic, 1)` ensures SUBACK
-4. **Clear retained messages** — old retained delta messages may interfere
-
-## Bugs found during testing
-
-1. **EMQX CRL check** — `enable_crl_check = true` in emqx.conf blocked ALL mTLS connections because step-ca CRL endpoints aren't reachable from Docker. Fixed: set to `false`.
-
-2. **EMQX server cert missing LAN IP** — SAN only had `DNS:emqx, DNS:localhost, IP:127.0.0.1`. ESP32's mbedtls correctly rejected it when connecting to `192.168.1.240`. Fixed: regenerated cert with `--san 192.168.1.240`.
-
-3. **Server returned wrong CA chain** — Provisioner returned only root_ca.crt but EMQX server cert is signed by intermediate CA. ESP32 couldn't verify server cert. Fixed: return intermediate_ca.crt.
-
-4. **tsx caching** — Server code changes don't take effect without `--no-cache` flag. The compiled JS is cached by tsx/esbuild.
-
-5. **PaqettCertStorage::initialize() can't be called twice** — ESP32 Preferences `begin()` fails if namespace already open. Fixed: added `close()` method.
-
-6. **PaqettOTA.cpp missing `#include <WiFi.h>`** — Build error on ESP32-C6. Fixed.
-
-7. **PubSubClient SUBACK not processed** — `subscribe()` called in `begin()` but `loop()` not called before entering test phases. Fixed: added loop() calls after subscribe.
-
-8. **Server API response format** — Tests expected flat objects but API wraps in `{data: ...}` and `setDesired` expects `{state: ...}` wrapper. Fixed in test helper.
-
-9. **Server `action` vs SDK `command` field** — Server sends `{id, action, payload}` but SDK reads `doc["command"]`. Not yet confirmed in tests (blocked by delivery issue), but will surface once commands work.
+10. **PubSubClient SUBACK timing** — `subscribe()` called in `begin()` but `loop()` not called before entering test phases. **Fix**: Added 10x loop() calls after subscribe.
 
 ## Architecture
 
@@ -113,7 +85,7 @@ ESP32 Firmware (C++)          Test Runner (TypeScript/vitest)
 - Firmware and test runner communicate via JSON lines over serial
 - Firmware waits for `{"action":"start"}` before running (handshake)
 - Self-contained tests (WiFi, NVS) run automatically
-- Interactive tests (shadow, commands) wait for host to trigger
+- Interactive tests (shadow, commands, OTA) wait for host to trigger
 - Test runner can reboot device via `{"action":"reboot"}`
 
 ## Files
@@ -132,9 +104,11 @@ ESP32 Firmware (C++)          Test Runner (TypeScript/vitest)
 
 | File | Change |
 |------|--------|
+| `device/src/PaqettDevice.cpp` | `_instance` guard, OTA version check, QoS 1, debug logging |
+| `device/src/PaqettCommands.cpp` | QoS 1 subscribe with return check |
+| `device/src/PaqettShadow.cpp` | QoS 1 subscribe with return check |
 | `device/src/PaqettCertStorage.h/cpp` | Added `close()` method |
 | `device/src/PaqettOTA.cpp` | Added `#include <WiFi.h>` |
-| `device/src/PaqettDevice.cpp` | Added SUBACK loop, `PAQETT_MQTT_NO_TLS` flag |
 | `device/src/PaqettWiFi.cpp` | Reordered cert/key setup |
 
 ## Server changes made during testing
@@ -143,9 +117,6 @@ ESP32 Firmware (C++)          Test Runner (TypeScript/vitest)
 |------|--------|
 | `emqx/emqx.conf` | `enable_crl_check = false` |
 | `emqx/acl.conf` | Added `paqett-test-runner` ACL |
+| `src/commands/command-service.ts` | `action` → `command: action` in MQTT payload |
 | `src/auth/step-ca-provisioner.ts` | Returns intermediate CA as chain |
-| `src/api/routes/claim.ts` | Passes chain path to provisioner |
-| `src/api/routes/devices.ts` | Passes chain path to provisioner |
-| `src/api/routes/commands.ts` | (unchanged, but tested) |
-| `src/shadow/shadow-mqtt.ts` | Debug logging (can remove) |
 | `pki/emqx/server.crt` | Regenerated with LAN IP SAN |
