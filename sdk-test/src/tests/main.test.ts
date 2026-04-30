@@ -25,9 +25,20 @@ beforeAll(async () => {
   mqtt = new TestMqtt();
   await mqtt.connect();
 
+  // Clear retained delta to prevent stale OTA from triggering during provisioning
+  mqtt.clearRetained("devices/paq_B87A5C75DC3C/shadow/delta");
+  await new Promise((r) => setTimeout(r, 500));
+
   // Create API key
   apiKey = await api.createApiKey();
   console.log(`  API key: ${apiKey.substring(0, 20)}...`);
+
+  // Clear stale OTA desired state from previous runs
+  try {
+    await api.setDesired(apiKey, "paq_B87A5C75DC3C", {
+      fw_target: null, ota_url: null, ota_sha256: null,
+    });
+  } catch { /* device may not exist yet */ }
 
   // Try "start" first (device in handshake loop).
   // If that doesn't work, send "reboot" to restart the device, then try start again.
