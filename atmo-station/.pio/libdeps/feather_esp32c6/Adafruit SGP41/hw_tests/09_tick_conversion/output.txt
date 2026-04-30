@@ -1,0 +1,15 @@
+TEST 09: tick_conversion
+Address 0x59 Detected
+	I2CWRITE @ 0x59 :: 0x36, 0x82, 	STOP
+	I2CREAD  @ 0x59 :: 0x0, 0x0, 0x81, 0x5, 0x87, 0x1B, 0x7, 0x61, 0xA5, 
+humidity 0% expected=0 actual=0 tol=1 -> PASS
+humidity 50% expected=32768 actual=32768 tol=1 -> PASS
+humidity 100% expected=65535 actual=65535 tol=1 -> PASS
+humidity -10% clamp expected=0 actual=0 tol=1 -> PASS
+humidity 150% clamp expected=65535 actual=65535 tol=1 -> PASS
+temp -45C expected=0 actual=0 tol=1 -> PASS
+temp 25C expected=26214 actual=26214 tol=1 -> PASS
+temp 130C expected=65535 actual=65535 tol=1 -> PASS
+temp -60C clamp expected=0 actual=0 tol=1 -> PASS
+temp 200C clamp expected=65535 actual=65535 tol=1 -> PASS
+TEST 09: PASS
